@@ -230,21 +230,16 @@ namespace DirStat
 
             _statusLabel.Text = (permanent ? "Permanently deleted: " : "Recycled: ") + path;
 
-            // Re-scan the parent so the model reflects what is on disk.
-            string rescanPath = null;
-            if (node.Parent != null && !string.IsNullOrEmpty(node.Parent.FullPath))
-                rescanPath = node.Parent.FullPath;
-            else
+            // Refresh the current scan root so the tree and treemap reflect the
+            // deletion. Do NOT rescan the deleted node's parent — that would
+            // change the visible root and look like the view drilled in.
+            if (_root != null && node != _root)
             {
-                try { rescanPath = System.IO.Path.GetDirectoryName(path); } catch { rescanPath = null; }
-            }
-
-            if (!string.IsNullOrEmpty(rescanPath))
-            {
-                StartScan(rescanPath);
+                StartScan(_root.Name);
             }
             else
             {
+                // The deleted node was itself the scan root — nothing to show.
                 _tree.Nodes.Clear();
                 _nodeIndex.Clear();
                 _treemap.SetRoot(null);
