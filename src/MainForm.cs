@@ -32,6 +32,10 @@ namespace DirStat
         private DirNode _root;
         private long _minBytes; // current min-file-size filter, 0 = off; persists across rescans
         private long[] _snapPoints = new long[] { 0 };
+        private bool _excludeSystem = true; // default: hide OS system files after scan
+        private bool _rootIsSystem;         // scan root itself sits inside a system path
+        private bool _hasSystemNodes;       // at least one descendant is a system node
+        private ToolStripMenuItem _excludeSystemMenuItem;
         private readonly ExtensionColorMap _colorMap = new ExtensionColorMap();
         private readonly Dictionary<DirNode, WinFormsTreeNode> _nodeIndex = new Dictionary<DirNode, WinFormsTreeNode>();
         private bool _suppressTreeSelect;
@@ -75,9 +79,19 @@ namespace DirStat
             zoomOutItem.ShortcutKeyDisplayString = "Ctrl+-";
             var zoomResetItem = new ToolStripMenuItem("&Reset Zoom", null, (s, e) => _treemap.ZoomReset())
             { ShortcutKeys = Keys.Control | Keys.D0 };
+            _excludeSystemMenuItem = new ToolStripMenuItem("Exclude &System Files",
+                null, (s, e) => ToggleExcludeSystem())
+            {
+                ShortcutKeys = Keys.Control | Keys.Shift | Keys.H,
+                CheckOnClick = false,
+                Checked = _excludeSystem,
+                Visible = false, // shown only after a scan, and only when meaningful
+            };
             viewMenu.DropDownItems.AddRange(new ToolStripItem[] {
                 openExplorerItem, new ToolStripSeparator(),
                 zoomInItem, zoomOutItem, zoomResetItem,
+                new ToolStripSeparator(),
+                _excludeSystemMenuItem,
             });
 
             var helpMenu = new ToolStripMenuItem("&Help");
@@ -348,7 +362,7 @@ namespace DirStat
             else parent.FileCount = Math.Max(0, parent.FileCount - 1);
 
             // Refresh Display* before touching the tree — ancestor labels read it.
-            _root.RecomputeDisplay(_minBytes);
+            _root.RecomputeDisplay(_minBytes, EffectiveExcludeSystem);
 
             _tree.BeginUpdate();
             try
@@ -645,8 +659,24 @@ namespace DirStat
             for (var p = targetNode.Parent; p != null; p = p.Parent)
                 p.Size += sizeDelta;
 
+            // Re-mark system flags on the new children (their IsSystem inherits
+            // from the rescanned targetNode if it was system, else is computed).
+            if (targetNode.IsSystem)
+            {
+                foreach (var c in newChildren) MarkAllSystem(c);
+            }
+            else
+            {
+                string basePath = targetNode.FullPath;
+                foreach (var c in newChildren)
+                {
+                    string sep = (basePath.EndsWith("\\") || basePath.EndsWith("/")) ? "" : "\\";
+                    MarkSystemRec(c, basePath + sep + c.Name);
+                }
+            }
+
             // Refresh Display* before reading labels and rebuilding tree nodes.
-            _root.RecomputeDisplay(_minBytes);
+            _root.RecomputeDisplay(_minBytes, EffectiveExcludeSystem);
 
             // Rebuild the WinForms tree under targetNode and refresh ancestor labels.
             WinFormsTreeNode tn;
@@ -821,6 +851,17 @@ namespace DirStat
             var r = t.Result;
             _root = r.Root;
 
+            // Mark system-path nodes once per scan. The menu toggle is then
+            // shown only when there's something to exclude AND the scan root
+            // isn't itself inside a system directory (in which case excluding
+            // would hide everything the user picked).
+            MarkSystemNodes(_root);
+            _rootIsSystem = _root.IsSystem;
+            _hasSystemNodes = !_rootIsSystem && AnySystemDescendant(_root);
+            _excludeSystemMenuItem.Visible = _hasSystemNodes;
+            _excludeSystemMenuItem.Checked = _excludeSystem;
+            _breadcrumb.SetSystemExcluded(EffectiveExcludeSystem);
+
             // Compute adaptive snap points from the actual file-size distribution,
             // then re-pick the closest snap to whatever threshold the user had
             // before — that persists the filter setting across rescans.
@@ -837,7 +878,7 @@ namespace DirStat
 
             // Populate Display* (immediate FileCount/DirCount won't survive the
             // recursive count semantics we want for labels) BEFORE rendering.
-            _root.RecomputeDisplay(_minBytes);
+            _root.RecomputeDisplay(_minBytes, EffectiveExcludeSystem);
 
             // Build extension stats UI and color map.
             _colorMap.Build(r.Extensions);
@@ -916,12 +957,75 @@ namespace DirStat
                 ComputeMaxFileSize(n.Children[i], ref max);
         }
 
+        // The system-files exclusion is suppressed when the scan root is itself
+        // inside a system directory — otherwise we'd hide everything the user
+        // just chose to look at.
+        private bool EffectiveExcludeSystem
+        {
+            get { return _excludeSystem && !_rootIsSystem; }
+        }
+
+        private void ToggleExcludeSystem()
+        {
+            _excludeSystem = !_excludeSystem;
+            _excludeSystemMenuItem.Checked = _excludeSystem;
+            ApplyFilter();
+            _breadcrumb.SetSystemExcluded(EffectiveExcludeSystem);
+        }
+
+        // Walk the tree once after a scan to mark which nodes sit inside an
+        // OS system path. Uses the parent-chain path to avoid quadratic
+        // FullPath rebuilds.
+        private static void MarkSystemNodes(DirNode root)
+        {
+            if (root == null) return;
+            MarkSystemRec(root, root.Name);
+        }
+
+        private static void MarkSystemRec(DirNode n, string fullPath)
+        {
+            n.IsSystem = SystemPaths.IsSystem(fullPath);
+            if (n.Children == null) return;
+            if (n.IsSystem)
+            {
+                // Descendants of a system root are also system — no further checks.
+                for (int i = 0; i < n.Children.Count; i++)
+                    MarkAllSystem(n.Children[i]);
+                return;
+            }
+            for (int i = 0; i < n.Children.Count; i++)
+            {
+                var c = n.Children[i];
+                string sep = (fullPath.EndsWith("\\") || fullPath.EndsWith("/")) ? "" : "\\";
+                MarkSystemRec(c, fullPath + sep + c.Name);
+            }
+        }
+
+        private static void MarkAllSystem(DirNode n)
+        {
+            n.IsSystem = true;
+            if (n.Children == null) return;
+            for (int i = 0; i < n.Children.Count; i++) MarkAllSystem(n.Children[i]);
+        }
+
+        private static bool AnySystemDescendant(DirNode n)
+        {
+            if (n == null || n.Children == null) return false;
+            for (int i = 0; i < n.Children.Count; i++)
+            {
+                var c = n.Children[i];
+                if (c.IsSystem) return true;
+                if (AnySystemDescendant(c)) return true;
+            }
+            return false;
+        }
+
         // Recompute Display* on the whole tree, rebuild the TreeView under the
         // current scan root, re-render the treemap, and refresh status totals.
         private void ApplyFilter()
         {
             if (_root == null) return;
-            _root.RecomputeDisplay(_minBytes);
+            _root.RecomputeDisplay(_minBytes, EffectiveExcludeSystem);
             RebuildTreeFromRoot();
             if (_treemap.ViewRoot != null && _treemap.ViewRoot.DisplaySize <= 0)
                 _treemap.SetViewRoot(_root);
@@ -1277,7 +1381,7 @@ namespace DirStat
 
         // ------- Helpers -------
 
-        public const string AppVersion = "0.6";
+        public const string AppVersion = "0.7";
 
         public static string FormatBytes(long bytes)
         {
@@ -1666,9 +1770,17 @@ namespace DirStat
         private Rectangle[] _segRects = new Rectangle[0];
         private Rectangle _resetRect;
         private int _hoverIndex = -2; // -2 = none, -1 = reset, >=0 = segment
+        private bool _systemExcluded;
 
         public event Action<DirNode> SegmentClicked;
         public event Action ResetClicked;
+
+        public void SetSystemExcluded(bool value)
+        {
+            if (_systemExcluded == value) return;
+            _systemExcluded = value;
+            Invalidate();
+        }
 
         public BreadcrumbBar()
         {
@@ -1786,9 +1898,10 @@ namespace DirStat
             }
 
             // Reset × at the far right (only when zoomed).
+            int rightX = ClientSize.Width - padX;
             if (_segments.Length > 1)
             {
-                int rx = ClientSize.Width - padX - 18;
+                int rx = rightX - 18;
                 _resetRect = new Rectangle(rx, y + 4, 16, h - 8);
                 Color rfg = (_hoverIndex == -1) ? Color.White : Color.FromArgb(160, 160, 160);
                 Color rbg = (_hoverIndex == -1) ? Color.FromArgb(56, 56, 56) : Color.Transparent;
@@ -1796,8 +1909,21 @@ namespace DirStat
                     using (var b = new SolidBrush(rbg)) g.FillRectangle(b, _resetRect);
                 TextRenderer.DrawText(g, "×", Font, _resetRect, rfg,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
+                rightX = rx - 8;
             }
             else _resetRect = Rectangle.Empty;
+
+            // Small "system hidden" badge to the left of the reset button.
+            if (_systemExcluded)
+            {
+                string txt = "system hidden";
+                int tw = TextRenderer.MeasureText(g, txt, Font).Width + 8;
+                var br = new Rectangle(rightX - tw, y + 4, tw, h - 8);
+                using (var bb = new SolidBrush(Color.FromArgb(60, 50, 30)))
+                    g.FillRectangle(bb, br);
+                TextRenderer.DrawText(g, txt, Font, br, Color.FromArgb(220, 190, 120),
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
+            }
         }
 
         private int DrawSeparator(Graphics g, int x, int y, int h, Color color)

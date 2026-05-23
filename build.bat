@@ -11,7 +11,7 @@ if not exist build mkdir build
     /reference:System.Core.dll ^
     /reference:System.Drawing.dll ^
     /reference:System.Windows.Forms.dll ^
-    src\Program.cs src\Win32.cs src\Scanner.cs src\TreeNode.cs src\TreemapRenderer.cs src\OpenDialog.cs src\MainForm.cs src\AssemblyInfo.cs
+    src\Program.cs src\Win32.cs src\Scanner.cs src\TreeNode.cs src\TreemapRenderer.cs src\SystemPaths.cs src\OpenDialog.cs src\MainForm.cs src\AssemblyInfo.cs
 if errorlevel 1 (
     echo Build failed.
     exit /b 1

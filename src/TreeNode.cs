@@ -22,6 +22,11 @@ namespace DirStat
         public long DisplayFileCount;
         public long DisplayDirCount;
 
+        // Marked at scan completion when this node is a recognised OS system
+        // path (or a descendant of one). When the "exclude system files" toggle
+        // is on, RecomputeDisplay treats these subtrees as size 0.
+        public bool IsSystem;
+
         private long _atomicSize;
         private long _atomicFileCount;
         private long _atomicDirCount;
@@ -86,10 +91,18 @@ namespace DirStat
         }
 
         // Recompute Display* across this subtree given a minimum file size in
-        // bytes. minBytes == 0 disables the filter (DisplaySize == Size).
-        // Returns this node's DisplaySize for use by recursive callers.
-        public long RecomputeDisplay(long minBytes)
+        // bytes and whether the user has enabled "exclude system files".
+        // minBytes == 0 disables the size filter; excludeSystem == false
+        // disables the system-files filter. Returns this node's DisplaySize.
+        public long RecomputeDisplay(long minBytes, bool excludeSystem)
         {
+            if (excludeSystem && IsSystem)
+            {
+                DisplaySize = 0;
+                DisplayFileCount = 0;
+                DisplayDirCount = 0;
+                return 0;
+            }
             if (!IsDirectory)
             {
                 DisplaySize = (Size >= minBytes) ? Size : 0;
@@ -107,7 +120,7 @@ namespace DirStat
             {
                 foreach (var c in Children)
                 {
-                    long cs = c.RecomputeDisplay(minBytes);
+                    long cs = c.RecomputeDisplay(minBytes, excludeSystem);
                     sumSize += cs;
                     if (c.IsDirectory)
                     {
