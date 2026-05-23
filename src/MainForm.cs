@@ -164,6 +164,7 @@ namespace DirStat
                 if (n != null) _treemap.SetViewRoot(n);
             };
             _breadcrumb.ResetClicked += delegate() { _treemap.ZoomReset(); };
+            _breadcrumb.SystemBadgeClicked += delegate() { ToggleExcludeSystem(); };
 
             // Extension list
             _extList = new ListView
@@ -860,7 +861,7 @@ namespace DirStat
             _hasSystemNodes = !_rootIsSystem && AnySystemDescendant(_root);
             _excludeSystemMenuItem.Visible = _hasSystemNodes;
             _excludeSystemMenuItem.Checked = _excludeSystem;
-            _breadcrumb.SetSystemExcluded(EffectiveExcludeSystem);
+            _breadcrumb.SetSystemState(_hasSystemNodes, EffectiveExcludeSystem);
 
             // Compute adaptive snap points from the actual file-size distribution,
             // then re-pick the closest snap to whatever threshold the user had
@@ -970,7 +971,7 @@ namespace DirStat
             _excludeSystem = !_excludeSystem;
             _excludeSystemMenuItem.Checked = _excludeSystem;
             ApplyFilter();
-            _breadcrumb.SetSystemExcluded(EffectiveExcludeSystem);
+            _breadcrumb.SetSystemState(_hasSystemNodes, EffectiveExcludeSystem);
         }
 
         // Walk the tree once after a scan to mark which nodes sit inside an
@@ -1381,7 +1382,7 @@ namespace DirStat
 
         // ------- Helpers -------
 
-        public const string AppVersion = "0.7";
+        public const string AppVersion = "0.8";
 
         public static string FormatBytes(long bytes)
         {
@@ -1769,16 +1770,25 @@ namespace DirStat
         private DirNode[] _segments = new DirNode[0]; // scanRoot ... viewRoot
         private Rectangle[] _segRects = new Rectangle[0];
         private Rectangle _resetRect;
-        private int _hoverIndex = -2; // -2 = none, -1 = reset, >=0 = segment
-        private bool _systemExcluded;
+        private Rectangle _systemRect;
+        // -2 = none, -1 = reset, -3 = system badge, >=0 = segment
+        private int _hoverIndex = -2;
+        private bool _systemAvailable;
+        private bool _systemHidden;
 
         public event Action<DirNode> SegmentClicked;
         public event Action ResetClicked;
+        public event Action SystemBadgeClicked;
 
-        public void SetSystemExcluded(bool value)
+        // Update the system-files badge. `available` controls whether the badge
+        // shows at all (false → no system files in scope, or the scan root is
+        // itself system). `hidden` toggles the badge's text and colour between
+        // "system files hidden" and "showing system files".
+        public void SetSystemState(bool available, bool hidden)
         {
-            if (_systemExcluded == value) return;
-            _systemExcluded = value;
+            if (_systemAvailable == available && _systemHidden == hidden) return;
+            _systemAvailable = available;
+            _systemHidden = hidden;
             Invalidate();
         }
 
@@ -1913,17 +1923,26 @@ namespace DirStat
             }
             else _resetRect = Rectangle.Empty;
 
-            // Small "system hidden" badge to the left of the reset button.
-            if (_systemExcluded)
+            // Clickable system-files badge to the left of the reset button.
+            // Two states: "system files hidden" (active filter) and "showing
+            // system files" (filter off but option available).
+            if (_systemAvailable)
             {
-                string txt = "system hidden";
-                int tw = TextRenderer.MeasureText(g, txt, Font).Width + 8;
-                var br = new Rectangle(rightX - tw, y + 4, tw, h - 8);
-                using (var bb = new SolidBrush(Color.FromArgb(60, 50, 30)))
-                    g.FillRectangle(bb, br);
-                TextRenderer.DrawText(g, txt, Font, br, Color.FromArgb(220, 190, 120),
+                string txt = _systemHidden ? "system files hidden" : "showing system files";
+                int tw = TextRenderer.MeasureText(g, txt, Font).Width + 12;
+                _systemRect = new Rectangle(rightX - tw, y + 4, tw, h - 8);
+                bool hot = (_hoverIndex == -3);
+                Color bgCol = _systemHidden
+                    ? (hot ? Color.FromArgb(78, 64, 38) : Color.FromArgb(60, 50, 30))
+                    : (hot ? Color.FromArgb(64, 64, 64) : Color.FromArgb(48, 48, 48));
+                Color fgCol = _systemHidden
+                    ? Color.FromArgb(230, 200, 130)
+                    : Color.FromArgb(180, 180, 180);
+                using (var bb = new SolidBrush(bgCol)) g.FillRectangle(bb, _systemRect);
+                TextRenderer.DrawText(g, txt, Font, _systemRect, fgCol,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
             }
+            else _systemRect = Rectangle.Empty;
         }
 
         private int DrawSeparator(Graphics g, int x, int y, int h, Color color)
@@ -1976,6 +1995,11 @@ namespace DirStat
                 var rh = ResetClicked;
                 if (rh != null) rh();
             }
+            else if (hit == -3)
+            {
+                var sb = SystemBadgeClicked;
+                if (sb != null) sb();
+            }
             else if (hit >= 0 && hit < _segments.Length)
             {
                 var sh = SegmentClicked;
@@ -1986,6 +2010,7 @@ namespace DirStat
         private int HitTest(int x, int y)
         {
             if (_resetRect.Width > 0 && _resetRect.Contains(x, y)) return -1;
+            if (_systemRect.Width > 0 && _systemRect.Contains(x, y)) return -3;
             for (int i = 0; i < _segRects.Length; i++)
             {
                 if (_segRects[i].Width > 0 && _segRects[i].Contains(x, y))
