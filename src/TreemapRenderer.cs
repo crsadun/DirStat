@@ -249,10 +249,17 @@ namespace DirStat
             bool tinyW = (x1 - x0) < 3;
             bool tinyH = (y1 - y0) < 3;
 
+            // Draw a 1-pixel frame around each leaf when there is room (>= 4 px in
+            // both dimensions). Same-extension neighbors share the same fill color,
+            // and the frame is what keeps them visually distinct.
+            bool drawFrame = (x1 - x0) >= 4 && (y1 - y0) >= 4;
+            const double FrameIntensity = 0.2;
+
             int bR = baseColor.R, bG = baseColor.G, bB = baseColor.B;
 
             for (int y = y0; y < y1; y++)
             {
+                bool yEdge = drawFrame && (y == y0 || y == y1 - 1);
                 byte* row = basePtr + y * stride + x0 * 4;
                 double ny = (y + 0.5 - cy) / hh;
                 if (ny < -1.0) ny = -1.0; else if (ny > 1.0) ny = 1.0;
@@ -261,7 +268,12 @@ namespace DirStat
                 for (int x = x0; x < x1; x++)
                 {
                     double intensity;
-                    if (tinyW || tinyH)
+                    bool xEdge = drawFrame && (x == x0 || x == x1 - 1);
+                    if (yEdge || xEdge)
+                    {
+                        intensity = FrameIntensity;
+                    }
+                    else if (tinyW || tinyH)
                     {
                         intensity = 0.7;
                     }

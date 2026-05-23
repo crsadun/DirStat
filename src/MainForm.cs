@@ -1061,7 +1061,7 @@ namespace DirStat
 
         // ------- Helpers -------
 
-        public const string AppVersion = "0.4";
+        public const string AppVersion = "0.5";
 
         public static string FormatBytes(long bytes)
         {
