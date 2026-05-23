@@ -228,16 +228,9 @@ namespace DirStat
                 return;
             }
 
-            _statusLabel.Text = (permanent ? "Permanently deleted: " : "Recycled: ") + path;
-
-            // Refresh the current scan root so the tree and treemap reflect the
-            // deletion. Do NOT rescan the deleted node's parent — that would
-            // change the visible root and look like the view drilled in.
-            if (_root != null && node != _root)
-            {
-                StartScan(_root.Name);
-            }
-            else
+            // Update the in-memory tree in place — do NOT rescan, otherwise the
+            // tree collapses back to the root and the user loses their place.
+            if (_root == null || node == _root)
             {
                 // The deleted node was itself the scan root — nothing to show.
                 _tree.Nodes.Clear();
@@ -247,6 +240,67 @@ namespace DirStat
                 _root = null;
                 Text = "DirStat " + AppVersion;
             }
+            else
+            {
+                RemoveNodeInPlace(node);
+            }
+
+            _statusLabel.Text = (permanent ? "Permanently deleted: " : "Recycled: ") + path;
+        }
+
+        // Remove `node` from its parent's children and update the UI in place.
+        // Size is bubbled up the ancestor chain; FileCount/DirCount only need to
+        // change on the immediate parent (they track immediate-children counts).
+        // Selection moves to the parent, lazy-expanding the path if needed.
+        private void RemoveNodeInPlace(DirNode node)
+        {
+            DirNode parent = node.Parent;
+            if (parent == null) return;
+
+            if (parent.Children != null)
+                parent.Children.Remove(node);
+
+            long delta = -node.Size;
+            for (var p = parent; p != null; p = p.Parent)
+                p.Size += delta;
+
+            if (node.IsDirectory) parent.DirCount = Math.Max(0, parent.DirCount - 1);
+            else parent.FileCount = Math.Max(0, parent.FileCount - 1);
+
+            _tree.BeginUpdate();
+            try
+            {
+                WinFormsTreeNode nodeTn;
+                if (_nodeIndex.TryGetValue(node, out nodeTn))
+                {
+                    RemoveSubtreeIndex(nodeTn);
+                    _nodeIndex.Remove(node);
+                    if (nodeTn.Parent != null) nodeTn.Parent.Nodes.Remove(nodeTn);
+                    else _tree.Nodes.Remove(nodeTn);
+                }
+
+                for (var p = parent; p != null; p = p.Parent)
+                {
+                    WinFormsTreeNode ptn;
+                    if (_nodeIndex.TryGetValue(p, out ptn))
+                        ptn.Text = FormatTreeLabel(p);
+                }
+            }
+            finally { _tree.EndUpdate(); }
+
+            // Rebuild extension stats from the surviving tree.
+            var stats = new ExtensionStats();
+            AccumulateExtensions(_root, stats);
+            _colorMap.Build(stats);
+            PopulateExtList(stats, _root.Size);
+
+            // Re-render the treemap and move selection/highlight to the parent.
+            _treemap.SetRoot(_root);
+            _treemap.SetHighlight(parent);
+            Treemap_SelectionChanged(this, parent);
+
+            _statusFiles.Text = _root.FileCount.ToString("N0") + " files";
+            _statusBytes.Text = FormatBytes(_root.Size);
         }
 
         // ------- Drive menu -------
@@ -414,6 +468,159 @@ namespace DirStat
             _statusLabel.Text = string.Format("Refreshed {0} ({1})", path,
                 delta == 0 ? "no change"
                 : (delta > 0 ? "+" : "-") + FormatBytes(Math.Abs(delta)));
+        }
+
+        // Rescan a directory subtree in place: replace its children with a fresh scan
+        // while preserving the visible root. Sizes/labels on ancestors are updated.
+        private void RescanSubtree(DirNode targetNode)
+        {
+            if (targetNode == null || !targetNode.IsDirectory) return;
+            string path = targetNode.FullPath;
+            if (string.IsNullOrEmpty(path)) return;
+
+            // Rescanning the visible root is equivalent to a full refresh.
+            if (targetNode == _root)
+            {
+                StartScan(path);
+                return;
+            }
+
+            OnStop();
+            _scanCts = new CancellationTokenSource();
+            var ct = _scanCts.Token;
+
+            _statusLabel.Text = "Rescanning " + path + "…";
+            _statusProgress.Visible = true;
+
+            var scanner = new Scanner(path, OnProgressFromScanner, ct);
+            _scanTask = scanner.RunAsync();
+            DirNode captured = targetNode;
+            _scanTask.ContinueWith(t => OnSubtreeRescanDone(t, captured, path),
+                TaskScheduler.FromCurrentSynchronizationContext());
+        }
+
+        private void OnSubtreeRescanDone(Task<ScanResult> t, DirNode targetNode, string path)
+        {
+            _statusProgress.Visible = false;
+            if (t.IsFaulted)
+            {
+                string emsg = "unknown";
+                if (t.Exception != null) emsg = t.Exception.GetBaseException().Message;
+                _statusLabel.Text = "Rescan failed: " + emsg;
+                return;
+            }
+            if (t.IsCanceled)
+            {
+                _statusLabel.Text = "Rescan canceled.";
+                return;
+            }
+            var r = t.Result;
+
+            long oldSize = targetNode.Size;
+
+            // Re-parent the fresh children onto the existing targetNode and adopt the
+            // new size/counts. Only Size propagates to ancestors (FileCount/DirCount
+            // are immediate-children counts, matching how the scanner records them).
+            var newChildren = r.Root.Children != null ? r.Root.Children : new List<DirNode>();
+            foreach (var c in newChildren) ReparentRecursive(c, targetNode);
+
+            targetNode.Children = newChildren;
+            targetNode.Size = r.Root.Size;
+            targetNode.FileCount = r.Root.FileCount;
+            targetNode.DirCount = r.Root.DirCount;
+
+            long sizeDelta = r.Root.Size - oldSize;
+            for (var p = targetNode.Parent; p != null; p = p.Parent)
+                p.Size += sizeDelta;
+
+            // Rebuild the WinForms tree under targetNode and refresh ancestor labels.
+            WinFormsTreeNode tn;
+            if (_nodeIndex.TryGetValue(targetNode, out tn))
+            {
+                RemoveSubtreeIndex(tn);
+
+                _tree.BeginUpdate();
+                try
+                {
+                    bool wasExpanded = tn.IsExpanded;
+                    tn.Nodes.Clear();
+                    if (targetNode.Children != null && targetNode.Children.Count > 0)
+                    {
+                        if (wasExpanded)
+                        {
+                            var children = new WinFormsTreeNode[targetNode.Children.Count];
+                            for (int i = 0; i < targetNode.Children.Count; i++)
+                                children[i] = MakeTreeNode(targetNode.Children[i]);
+                            tn.Nodes.AddRange(children);
+                            tn.Expand();
+                        }
+                        else
+                        {
+                            tn.Nodes.Add(new WinFormsTreeNode("…"));
+                        }
+                    }
+                    tn.Text = FormatTreeLabel(targetNode);
+                    for (var p = targetNode.Parent; p != null; p = p.Parent)
+                    {
+                        WinFormsTreeNode ptn;
+                        if (_nodeIndex.TryGetValue(p, out ptn))
+                            ptn.Text = FormatTreeLabel(p);
+                    }
+                }
+                finally { _tree.EndUpdate(); }
+            }
+
+            // Rebuild extension stats from the entire tree (the scanner's stats only
+            // cover the rescanned subtree).
+            var stats = new ExtensionStats();
+            AccumulateExtensions(_root, stats);
+            _colorMap.Build(stats);
+            PopulateExtList(stats, _root.Size);
+
+            // Re-render the treemap. Reset the highlight to targetNode so any stale
+            // reference into the old subtree is dropped.
+            _treemap.SetRoot(_root);
+            _treemap.SetHighlight(targetNode);
+
+            _statusFiles.Text = _root.FileCount.ToString("N0") + " files";
+            _statusBytes.Text = FormatBytes(_root.Size);
+            _statusLabel.Text = string.Format("Rescanned {0}. {1}, {2} files.",
+                path, FormatBytes(targetNode.Size), targetNode.FileCount.ToString("N0"));
+        }
+
+        private static void ReparentRecursive(DirNode n, DirNode newParent)
+        {
+            n.Parent = newParent;
+            if (n.IsDirectory && n.Children != null)
+            {
+                foreach (var c in n.Children)
+                    ReparentRecursive(c, n);
+            }
+        }
+
+        private void RemoveSubtreeIndex(WinFormsTreeNode tn)
+        {
+            foreach (WinFormsTreeNode child in tn.Nodes)
+            {
+                DirNode dn = child.Tag as DirNode;
+                if (dn != null) _nodeIndex.Remove(dn);
+                RemoveSubtreeIndex(child);
+            }
+        }
+
+        private static void AccumulateExtensions(DirNode n, ExtensionStats stats)
+        {
+            if (n == null) return;
+            if (!n.IsDirectory)
+            {
+                string ext = System.IO.Path.GetExtension(n.Name);
+                if (string.IsNullOrEmpty(ext)) ext = "<no extension>";
+                stats.Add(ext, n.Size);
+                return;
+            }
+            if (n.Children == null) return;
+            foreach (var c in n.Children)
+                AccumulateExtensions(c, stats);
         }
 
         private void OnStop()
@@ -589,24 +796,26 @@ namespace DirStat
             menu.ForeColor = MenuFg;
             menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
 
-            // Refresh items first.
+            // Rescan items first.
             DirNode capturedNode = node;
+            DirNode parentNode = node.Parent;
             if (node.IsDirectory)
             {
-                menu.Items.Add(NewItem("&Refresh", delegate { StartScan(path); }));
+                menu.Items.Add(NewItem("&Rescan this folder",
+                    delegate { RescanSubtree(capturedNode); }));
             }
             else
             {
                 menu.Items.Add(NewItem("&Refresh", delegate { RefreshFileNode(capturedNode); }));
+                var rescanParent = NewItem("&Rescan parent folder", delegate
+                {
+                    if (parentNode != null && parentNode.IsDirectory)
+                        RescanSubtree(parentNode);
+                });
+                rescanParent.Enabled = parentNode != null && parentNode.IsDirectory
+                                       && !string.IsNullOrEmpty(parentNode.FullPath);
+                menu.Items.Add(rescanParent);
             }
-            DirNode parentNode = node.Parent;
-            var refreshParent = NewItem("Refresh &parent directory", delegate
-            {
-                if (parentNode != null && !string.IsNullOrEmpty(parentNode.FullPath))
-                    StartScan(parentNode.FullPath);
-            });
-            refreshParent.Enabled = parentNode != null && !string.IsNullOrEmpty(parentNode.FullPath);
-            menu.Items.Add(refreshParent);
             menu.Items.Add(new ToolStripSeparator());
 
             if (node.IsDirectory)
@@ -805,7 +1014,7 @@ namespace DirStat
 
         // ------- Helpers -------
 
-        public const string AppVersion = "0.2";
+        public const string AppVersion = "0.3";
 
         public static string FormatBytes(long bytes)
         {
