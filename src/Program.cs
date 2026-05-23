@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Windows.Forms;
 
 namespace DirStat
@@ -11,17 +12,40 @@ namespace DirStat
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            var form = new MainForm();
-            if (args != null && args.Length > 0 && System.IO.Directory.Exists(args[0]))
+            // Resolve a startup path from a CLI argument if one was given. If the
+            // argument is a file, fall back to its containing folder (matches the
+            // dialog's behaviour).
+            string startupPath = null;
+            if (args != null && args.Length > 0 && !string.IsNullOrEmpty(args[0]))
             {
-                form.Shown += (s, e) =>
+                string a = args[0];
+                if (Directory.Exists(a)) startupPath = a;
+                else if (File.Exists(a))
                 {
-                    // Defer until the form is fully visible.
-                    var mi = typeof(MainForm).GetMethod("StartScan",
-                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                    if (mi != null) mi.Invoke(form, new object[] { args[0] });
-                };
+                    try { startupPath = Path.GetDirectoryName(a); }
+                    catch { startupPath = null; }
+                }
             }
+
+            var form = new MainForm();
+            form.Shown += delegate(object s, EventArgs e)
+            {
+                if (!string.IsNullOrEmpty(startupPath))
+                {
+                    form.BeginScan(startupPath);
+                    return;
+                }
+                // No CLI path → show the WinDirStat-style picker so the user
+                // doesn't have to traverse menus to start a scan.
+                using (var dlg = new OpenDialog())
+                {
+                    if (dlg.ShowDialog(form) == DialogResult.OK
+                        && !string.IsNullOrEmpty(dlg.SelectedPath))
+                    {
+                        form.BeginScan(dlg.SelectedPath);
+                    }
+                }
+            };
             Application.Run(form);
         }
     }

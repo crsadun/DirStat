@@ -15,6 +15,13 @@ namespace DirStat
         public long FileCount;
         public long DirCount;
 
+        // Mirror counters that respect the user's minimum-file-size filter.
+        // After scan and on every threshold change they're set by RecomputeDisplay;
+        // when no filter is active they equal the unfiltered values above.
+        public long DisplaySize;
+        public long DisplayFileCount;
+        public long DisplayDirCount;
+
         private long _atomicSize;
         private long _atomicFileCount;
         private long _atomicDirCount;
@@ -73,6 +80,50 @@ namespace DirStat
                 Children.Sort((a, b) => b.Size.CompareTo(a.Size));
             }
             FreezeAtomicCounts();
+            // Display* are populated by the caller via RecomputeDisplay so that
+            // file/dir counts can be recursive (unlike the immediate-only
+            // FileCount/DirCount above) and react to the size filter.
+        }
+
+        // Recompute Display* across this subtree given a minimum file size in
+        // bytes. minBytes == 0 disables the filter (DisplaySize == Size).
+        // Returns this node's DisplaySize for use by recursive callers.
+        public long RecomputeDisplay(long minBytes)
+        {
+            if (!IsDirectory)
+            {
+                DisplaySize = (Size >= minBytes) ? Size : 0;
+                DisplayFileCount = (DisplaySize > 0) ? 1 : 0;
+                DisplayDirCount = 0;
+                return DisplaySize;
+            }
+
+            // DisplayFileCount and DisplayDirCount are recursive (total
+            // surviving files / dirs in the subtree), unlike the original
+            // FileCount/DirCount which only count immediate children.
+            // Recursive is far more informative in tree labels.
+            long sumSize = 0, sumFiles = 0, sumDirs = 0;
+            if (Children != null)
+            {
+                foreach (var c in Children)
+                {
+                    long cs = c.RecomputeDisplay(minBytes);
+                    sumSize += cs;
+                    if (c.IsDirectory)
+                    {
+                        if (cs > 0) sumDirs += 1 + c.DisplayDirCount;
+                        sumFiles += c.DisplayFileCount;
+                    }
+                    else if (cs > 0)
+                    {
+                        sumFiles += 1;
+                    }
+                }
+            }
+            DisplaySize = sumSize;
+            DisplayFileCount = sumFiles;
+            DisplayDirCount = sumDirs;
+            return sumSize;
         }
     }
 

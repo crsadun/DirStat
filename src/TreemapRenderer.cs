@@ -103,29 +103,33 @@ namespace DirStat
             if (rect.Width < 1f || rect.Height < 1f) return;
             if (!node.IsDirectory || node.Children == null || node.Children.Count == 0)
             {
-                if (!node.IsDirectory && node.Size > 0)
+                if (!node.IsDirectory && node.DisplaySize > 0)
                     outItems.Add(new TreemapItem { Node = node, Rect = rect });
                 return;
             }
 
-            // Sum sizes of children that contribute area.
+            // Sum sizes of children that contribute area. Reads DisplaySize so
+            // the min-file-size filter shrinks (or removes) cells live.
             long total = 0;
             int countContrib = 0;
             for (int i = 0; i < node.Children.Count; i++)
             {
-                long s = node.Children[i].Size;
+                long s = node.Children[i].DisplaySize;
                 if (s > 0) { total += s; countContrib++; }
             }
             if (total <= 0 || countContrib == 0) return;
 
             double areaScale = (double)rect.Width * (double)rect.Height / total;
 
-            // Build areas array. Children are pre-sorted descending by Finalize_PostScan.
+            // Build areas array. Children remain in their post-scan size-descending
+            // order; with the filter active a smaller child may have a larger
+            // DisplaySize than a previously-larger sibling, but the squarify
+            // algorithm only cares about the area values, not strict ordering.
             var children = new List<DirNode>(countContrib);
             var areas = new List<double>(countContrib);
             for (int i = 0; i < node.Children.Count; i++)
             {
-                long s = node.Children[i].Size;
+                long s = node.Children[i].DisplaySize;
                 if (s <= 0) continue;
                 children.Add(node.Children[i]);
                 areas.Add(s * areaScale);
