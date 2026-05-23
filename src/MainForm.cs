@@ -61,7 +61,18 @@ namespace DirStat
             var viewMenu = new ToolStripMenuItem("&View");
             var openExplorerItem = new ToolStripMenuItem("Show in &Explorer", null, (s, e) => OnShowInExplorer())
             { ShortcutKeys = Keys.Control | Keys.E };
-            viewMenu.DropDownItems.Add(openExplorerItem);
+            var zoomInItem = new ToolStripMenuItem("Zoom &In", null, (s, e) => OnZoomIn())
+            { ShortcutKeys = Keys.Control | Keys.Oemplus };
+            zoomInItem.ShortcutKeyDisplayString = "Ctrl+=";
+            var zoomOutItem = new ToolStripMenuItem("Zoom &Out", null, (s, e) => _treemap.ZoomOut())
+            { ShortcutKeys = Keys.Control | Keys.OemMinus };
+            zoomOutItem.ShortcutKeyDisplayString = "Ctrl+-";
+            var zoomResetItem = new ToolStripMenuItem("&Reset Zoom", null, (s, e) => _treemap.ZoomReset())
+            { ShortcutKeys = Keys.Control | Keys.D0 };
+            viewMenu.DropDownItems.AddRange(new ToolStripItem[] {
+                openExplorerItem, new ToolStripSeparator(),
+                zoomInItem, zoomOutItem, zoomResetItem,
+            });
 
             var helpMenu = new ToolStripMenuItem("&Help");
             var aboutItem = new ToolStripMenuItem("&About", null, (s, e) =>
@@ -183,7 +194,24 @@ namespace DirStat
                     e.Handled = true;
                     e.SuppressKeyPress = true;
                 }
+                return;
             }
+            // Backspace zooms out one level (file-browser style). No text inputs
+            // in this form make this safe to capture form-wide.
+            if (e.KeyCode == Keys.Back && !e.Control && !e.Alt && !e.Shift)
+            {
+                _treemap.ZoomOut();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            }
+        }
+
+        private void OnZoomIn()
+        {
+            // Prefer the tree selection as the zoom target; falls back to the
+            // largest child of the current view root inside ZoomInOnTarget.
+            DirNode target = _tree.SelectedNode != null ? _tree.SelectedNode.Tag as DirNode : null;
+            _treemap.ZoomInOnTarget(target);
         }
 
         private void DeleteNode(DirNode node, bool permanent)
@@ -294,13 +322,26 @@ namespace DirStat
             _colorMap.Build(stats);
             PopulateExtList(stats, _root.Size);
 
-            // Re-render the treemap and move selection/highlight to the parent.
-            _treemap.SetRoot(_root);
+            // If the zoomed view root was the deleted node or one of its
+            // descendants, the reference is now stale — fall back to its parent.
+            if (IsAncestorOrSelf(node, _treemap.ViewRoot))
+                _treemap.SetViewRoot(parent);
+
+            // Re-render (preserve any active zoom) and move selection/highlight.
+            _treemap.Rerender();
             _treemap.SetHighlight(parent);
             Treemap_SelectionChanged(this, parent);
 
             _statusFiles.Text = _root.FileCount.ToString("N0") + " files";
             _statusBytes.Text = FormatBytes(_root.Size);
+        }
+
+        // True if `ancestor` equals `node` or is one of its ancestors.
+        private static bool IsAncestorOrSelf(DirNode ancestor, DirNode node)
+        {
+            for (var c = node; c != null; c = c.Parent)
+                if (c == ancestor) return true;
+            return false;
         }
 
         // ------- Drive menu -------
@@ -577,9 +618,15 @@ namespace DirStat
             _colorMap.Build(stats);
             PopulateExtList(stats, _root.Size);
 
-            // Re-render the treemap. Reset the highlight to targetNode so any stale
-            // reference into the old subtree is dropped.
-            _treemap.SetRoot(_root);
+            // If the user was zoomed into a node inside the rescanned subtree, the
+            // old descendant DirNodes are gone — fall back the view root to the
+            // (still-valid) rescanned node itself.
+            if (_treemap.ViewRoot != targetNode && IsAncestorOrSelf(targetNode, _treemap.ViewRoot))
+                _treemap.SetViewRoot(targetNode);
+
+            // Re-render (preserve any active zoom). Reset the highlight to targetNode
+            // so any stale reference into the old subtree is dropped.
+            _treemap.Rerender();
             _treemap.SetHighlight(targetNode);
 
             _statusFiles.Text = _root.FileCount.ToString("N0") + " files";
@@ -1014,7 +1061,7 @@ namespace DirStat
 
         // ------- Helpers -------
 
-        public const string AppVersion = "0.3";
+        public const string AppVersion = "0.4";
 
         public static string FormatBytes(long bytes)
         {
@@ -1049,7 +1096,8 @@ namespace DirStat
     // Custom panel that owns the rendered treemap bitmap and handles hit-testing.
     public sealed class TreemapPanel : Control
     {
-        private DirNode _root;
+        private DirNode _root;       // scan root (top of the loaded tree)
+        private DirNode _viewRoot;   // node currently filling the panel (drill-down zoom)
         private DirNode _highlightNode;
         private string _highlightExt;
         private Bitmap _bmp;
@@ -1061,22 +1109,102 @@ namespace DirStat
         public event EventHandler<DirNode> SelectionChanged;
         public event EventHandler<DirNode> NodeActivated;
         public event Action<DirNode, Point> ContextRequested; // location is in screen coords
+        public event EventHandler<DirNode> ViewRootChanged;
+
+        public DirNode Root { get { return _root; } }
+        public DirNode ViewRoot { get { return _viewRoot; } }
 
         public TreemapPanel()
         {
             DoubleBuffered = true;
             SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint
-                     | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+                     | ControlStyles.ResizeRedraw | ControlStyles.UserPaint
+                     | ControlStyles.Selectable, true);
+            TabStop = true; // accept focus so wheel events arrive
             BackColor = Color.FromArgb(28, 28, 28);
         }
 
         public void SetRoot(DirNode root)
         {
             _root = root;
+            _viewRoot = root;
             _highlightNode = root;
             _highlightExt = null;
             ScheduleRender();
+            var h = ViewRootChanged;
+            if (h != null) h(this, _viewRoot);
         }
+
+        // Trigger a re-render without resetting view root / highlight. Use this
+        // after in-place edits (delete, subtree rescan) that change the tree
+        // contents but should preserve any zoom the user has set.
+        public void Rerender()
+        {
+            ScheduleRender();
+        }
+
+        // Set the drill-down view root. Pass null to reset to the scan root.
+        public void SetViewRoot(DirNode node)
+        {
+            if (node == null) node = _root;
+            if (node == null) return;
+            if (_viewRoot == node) return;
+            _viewRoot = node;
+            _highlightNode = node;
+            ScheduleRender();
+            var vr = ViewRootChanged;
+            if (vr != null) vr(this, _viewRoot);
+            var sc = SelectionChanged;
+            if (sc != null) sc(this, _viewRoot);
+        }
+
+        // Zoom in toward a panel-local point: find the item at that point and
+        // walk its ancestor chain up to the child of the current view root.
+        public void ZoomToward(PointF panelPoint)
+        {
+            if (_viewRoot == null || _renderer.Items == null) return;
+            var item = _renderer.ItemAt(panelPoint);
+            if (item == null) return;
+            var candidate = item.Node;
+            while (candidate != null && candidate.Parent != _viewRoot)
+                candidate = candidate.Parent;
+            if (candidate != null && candidate.IsDirectory
+                && candidate.Children != null && candidate.Children.Count > 0)
+                SetViewRoot(candidate);
+        }
+
+        // Zoom into the path of `target`. If target is null or doesn't descend
+        // from the current view root, zoom into the largest child of the view root.
+        public void ZoomInOnTarget(DirNode target)
+        {
+            if (_viewRoot == null) return;
+            DirNode candidate = null;
+            if (target != null)
+            {
+                candidate = target;
+                while (candidate != null && candidate.Parent != _viewRoot)
+                    candidate = candidate.Parent;
+            }
+            if (candidate == null && _viewRoot.Children != null && _viewRoot.Children.Count > 0)
+                candidate = _viewRoot.Children[0]; // largest (children sorted by size desc)
+            if (candidate != null && candidate.IsDirectory
+                && candidate.Children != null && candidate.Children.Count > 0)
+                SetViewRoot(candidate);
+        }
+
+        public void ZoomOut()
+        {
+            if (_viewRoot == null || _viewRoot.Parent == null) return;
+            SetViewRoot(_viewRoot.Parent);
+        }
+
+        public void ZoomReset()
+        {
+            if (_root == null) return;
+            SetViewRoot(_root);
+        }
+
+        public bool IsZoomed { get { return _viewRoot != null && _viewRoot != _root; } }
 
         public void SetHighlight(DirNode node)
         {
@@ -1167,7 +1295,8 @@ namespace DirStat
 
         private void RenderNow()
         {
-            if (Width < 4 || Height < 4 || _root == null)
+            DirNode renderRoot = _viewRoot != null ? _viewRoot : _root;
+            if (Width < 4 || Height < 4 || renderRoot == null)
             {
                 if (_bmp != null) { _bmp.Dispose(); _bmp = null; }
                 return;
@@ -1179,7 +1308,7 @@ namespace DirStat
                 picker = delegate(DirNode n) { return ColorMap.GetForNode(n); };
             else
                 picker = delegate(DirNode n) { return Color.Gray; };
-            _renderer.Render(bmp, _root, picker, BackColor);
+            _renderer.Render(bmp, renderRoot, picker, BackColor);
             if (_bmp != null) _bmp.Dispose();
             _bmp = bmp;
             UpdateHighlightRect();
@@ -1263,6 +1392,23 @@ namespace DirStat
                 var h = NodeActivated;
                 if (h != null) h(this, item.Node);
             }
+        }
+
+        // Grab focus on mouse enter so Ctrl+wheel zoom works without an extra click.
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            if (CanFocus && !Focused) Focus();
+        }
+
+        // Ctrl + wheel up: zoom toward the cursor; Ctrl + wheel down: zoom out.
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if ((Control.ModifierKeys & Keys.Control) != Keys.Control) return;
+            if (_viewRoot == null) return;
+            if (e.Delta > 0) ZoomToward(new PointF(e.X, e.Y));
+            else if (e.Delta < 0) ZoomOut();
         }
 
         protected override void Dispose(bool disposing)
