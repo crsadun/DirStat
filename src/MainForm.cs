@@ -99,7 +99,8 @@ namespace DirStat
                 MessageBox.Show(this,
                     "DirStat " + AppVersion + "\n" +
                     "A tool to visualize disk usage, inspired by WinDirStat\n\n" +
-                    "Copyright (C) 2026 Cristiano Sadun",
+                    "Copyright (C) 2026 Cristiano Sadun\n" +
+                    "Contact: " + ContactEmail(),
                     "About DirStat", MessageBoxButtons.OK, MessageBoxIcon.Information));
             helpMenu.DropDownItems.Add(aboutItem);
 
@@ -1383,6 +1384,22 @@ namespace DirStat
         // ------- Helpers -------
 
         public const string AppVersion = "1.0";
+
+        // Contact email reconstructed from XOR-obfuscated byte values at
+        // runtime, so the address appears as a plain literal neither in the
+        // source nor in the compiled binary — regex-based crawlers scanning
+        // the public repo (or the .exe asset) won't pick it up.
+        private static string ContactEmail()
+        {
+            byte[] x = new byte[] {
+                54,39,60,38,33,60,52,59,58,38,52,49,32,59,
+                21,
+                61,58,33,56,52,60,57,123,54,58,56
+            };
+            byte[] o = new byte[x.Length];
+            for (int i = 0; i < x.Length; i++) o[i] = (byte)(x[i] ^ 0x55);
+            return System.Text.Encoding.ASCII.GetString(o);
+        }
 
         public static string FormatBytes(long bytes)
         {
